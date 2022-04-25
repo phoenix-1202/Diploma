@@ -8,16 +8,16 @@ from utils import save_npy_img, image_manifold_size, write_json, get_text_loss
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 CHECKPOINT_PATH = "./checkpoint/last_state.pth"
+BEST_CHECKPOINT_PATH = "./checkpoint/best_last_state.pth"
 
-WIDTH = 108  # 108
-HEIGHT = 108  # 108
+WIDTH = 108
+HEIGHT = 108
 
-OBJ = 11  # 11
-LEN_CLASSES = 7  # 7
+OBJ = 11
+LEN_CLASSES = 7
 P = 4
 
 FROM = 0.5
-
 BATCH = 64
 
 
@@ -28,8 +28,7 @@ def count_non_zero(tensor):
     z = torch.zeros_like(x)
     x = torch.where(3 <= x, x, (x - 3) / 3)
     x = torch.where(x <= 8, x, (8 - x) / 3)
-    x = torch.where(x < 0, x, z)
-    x = torch.where(x < 0, -x, x)
+    x = torch.where(x < 0, -x, z)
     return x
 
 
@@ -310,8 +309,9 @@ class LayoutGAN:
         gen_opt = torch.optim.Adam(self.gen.parameters(), lr=10e-5, amsgrad=True)
         disc_opt = torch.optim.Adam(self.disc.parameters(), lr=10e-5, amsgrad=True)
 
-        count_criterion = torch.nn.MSELoss()
-        text_criterion = torch.nn.L1Loss()
+        main_criterion = torch.nn.BCELoss()
+        count_criterion = torch.nn.BCELoss()
+        text_criterion = torch.nn.BCELoss()
 
         row_data = np.load('./data/data.npy')
         dataloader = DataLoader(TensorDataset(torch.Tensor(row_data)), batch_size=BATCH, shuffle=True, drop_last=True)
@@ -346,96 +346,67 @@ class LayoutGAN:
             fake_pred = self.disc(fake_tensor)
             return fake_tensor, fake_pred
 
-        def gradient_penalty(real_data, generated_data):
-            alpha = torch.rand(64, 1, 1).to(device)
-            alpha = alpha.expand_as(real_data)
-            interpolated = alpha * real_data + (1 - alpha) * generated_data
-            interpolated = torch.autograd.Variable(interpolated, requires_grad=True).to(device)
-            prob_interpolated = self.disc(interpolated)
-
-            gradients = torch.autograd.grad(outputs=prob_interpolated, inputs=interpolated,
-                                            grad_outputs=torch.ones(prob_interpolated.size()).to(device),
-                                            create_graph=True, retain_graph=True)[0]
-
-            gradients = gradients.view(64, -1)
-            gradients_norm = gradients.norm(2, 1)
-
-            return torch.mean((gradients_norm - 1) ** 2)
-
-        out_gen = open("./samples/loss/loss_gen.txt", "w")
-        out_disc = open("./samples/loss/loss_disc.txt", "w")
-
         for epoch in range(start_epoch, n_epoch):
             print("Epoch ", epoch)
             idx = 0
             for data in tqdm(dataloader):
                 real_layout_tensor = data[0].to(device)
-                gen_loss = 0
-                disc_loss = 0
 
                 disc_opt.zero_grad()
+
                 d_real = self.disc(real_layout_tensor)
                 generated_tensor, d_generated = get_fake_pred(should_detach=True)
-                gp = gradient_penalty(real_layout_tensor, generated_tensor)
-                d_loss = d_generated.mean() - d_real.mean() + gp
-                disc_loss += d_loss.item()
-                d_loss.backward()
-                disc_opt.step()
+                zeros = torch.zeros_like(d_generated, requires_grad=True).to(device)
+                ones = torch.ones_like(d_generated, requires_grad=True).to(device)
+                d_loss = main_criterion(d_generated, zeros) + main_criterion(d_real, ones)
+                disc_loss = d_loss
 
-                disc_opt.zero_grad()
                 _, disc_fake_pred = get_fake_pred(should_detach=True)
                 count_fake = count_non_zero(_)
                 count_real = count_non_zero(real_layout_tensor)
                 zeros = torch.zeros_like(count_fake, requires_grad=True).to(device)
                 ones = torch.ones_like(count_fake, requires_grad=True).to(device)
-                disc_loss_count = count_criterion(count_fake, ones) - count_criterion(count_real, zeros)
-                disc_loss += disc_loss_count.item()
-                disc_loss_count.backward()
-                disc_opt.step()
+                disc_loss_count = count_criterion(count_fake, ones) + count_criterion(count_real, zeros)
+                disc_loss += disc_loss_count
 
-                disc_opt.zero_grad()
                 _, disc_fake_pred = get_fake_pred(should_detach=True)
                 tmp = get_text_loss(_)
                 text_fake = torch.tensor(tmp, requires_grad=True).to(device)
                 tmp = get_text_loss(real_layout_tensor)
                 text_real = torch.tensor(tmp, requires_grad=True).to(device)
-                zeros = torch.zeros_like(count_fake, requires_grad=True).to(device)
-                ones = torch.ones_like(count_fake, requires_grad=True).to(device)
-                disc_loss_text = 5 * (text_criterion(text_fake, ones) - text_criterion(text_real, zeros))
-                disc_loss += disc_loss_text.item()
-                disc_loss_text.backward()
+                zeros = torch.zeros_like(text_fake, requires_grad=True).to(device)
+                ones = torch.ones_like(text_fake, requires_grad=True).to(device)
+                disc_loss_text = 3 * (text_criterion(text_fake, ones) + text_criterion(text_real, zeros))
+                disc_loss += disc_loss_text
+
+                disc_loss.backward()
                 disc_opt.step()
 
-                if (idx + 1) % 5 == 0:
+                if (idx + 1) % 1 == 0:
                     gen_opt.zero_grad()
-                    _, disc_fake_pred = get_fake_pred(should_detach=False)
-                    g_loss = -disc_fake_pred.mean().view(-1)
-                    gen_loss += g_loss.item()
-                    g_loss.backward()
-                    gen_opt.step()
 
-                    gen_opt.zero_grad()
+                    _, disc_fake_pred = get_fake_pred(should_detach=False)
+                    ones = torch.ones_like(disc_fake_pred, requires_grad=True)
+                    g_loss = main_criterion(disc_fake_pred, ones)
+                    gen_loss = g_loss
+
                     _, disc_fake_pred = get_fake_pred(should_detach=False)
                     count = count_non_zero(_)
-                    label = torch.zeros_like(count, requires_grad=True).to(device)
-                    gen_loss_count = -count_criterion(count, label)
-                    gen_loss += gen_loss_count.item()
-                    gen_loss_count.backward()
-                    gen_opt.step()
+                    zeros = torch.zeros_like(count, requires_grad=True).to(device)
+                    gen_loss_count = count_criterion(count, zeros)
+                    gen_loss += gen_loss_count
 
-                    gen_opt.zero_grad()
                     _, disc_fake_pred = get_fake_pred(should_detach=False)
                     tmp = get_text_loss(_)
                     text_losses = torch.tensor(tmp, requires_grad=True).to(device)
-                    label = torch.zeros_like(text_losses, requires_grad=True).to(device)
-                    gen_loss_text = -text_criterion(text_losses, label)
-                    gen_loss += gen_loss_text.item()
-                    gen_loss_text.backward()
+                    zeros = torch.zeros_like(text_losses, requires_grad=True).to(device)
+                    gen_loss_text = 3 * text_criterion(text_losses, zeros)
+                    gen_loss += gen_loss_text
+
+                    gen_loss.backward()
                     gen_opt.step()
 
                 if counter % 49 == 0:
-                    print(gen_loss, file=out_gen)
-                    print(disc_loss, file=out_disc)
                     res_tensor, _ = get_fake_pred(should_detach=True)
                     count = count_non_zero(res_tensor)
                     cnt = torch.count_nonzero(count)
@@ -447,9 +418,17 @@ class LayoutGAN:
                                     'discriminator': self.disc.state_dict(),
                                     'gen_opt': gen_opt.state_dict(),
                                     'disc_opt': disc_opt.state_dict()
-                                    }, CHECKPOINT_PATH)
+                                    }, BEST_CHECKPOINT_PATH)
 
-                    if counter % 25 == 0:
+                    torch.save({'start_epoch': epoch + 1,
+                                'best_fail': BEST_MODEL_FAIL_OBJECTS,
+                                'generator': self.gen.state_dict(),
+                                'discriminator': self.disc.state_dict(),
+                                'gen_opt': gen_opt.state_dict(),
+                                'disc_opt': disc_opt.state_dict()
+                                }, CHECKPOINT_PATH)
+
+                    if counter % 10 == 0:
                         image = layout_bbox(res_tensor, WIDTH, HEIGHT)
                         write_json(res_tensor, '{:02d}_{:04d}'.format(epoch, idx))
                         size = image_manifold_size(list(image.size())[0])
