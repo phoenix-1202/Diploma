@@ -350,27 +350,25 @@ class LayoutGAN:
             print("Epoch ", epoch)
             idx = 0
             for data in tqdm(dataloader):
-                real_layout_tensor = data[0].to(device)
-
                 disc_opt.zero_grad()
 
+                real_layout_tensor = data[0].to(device)
                 d_real = self.disc(real_layout_tensor)
                 generated_tensor, d_generated = get_fake_pred(should_detach=True)
+
                 zeros = torch.zeros_like(d_generated, requires_grad=True).to(device)
                 ones = torch.ones_like(d_generated, requires_grad=True).to(device)
                 d_loss = main_criterion(d_generated, zeros) + main_criterion(d_real, ones)
                 disc_loss = d_loss
 
-                _, disc_fake_pred = get_fake_pred(should_detach=True)
-                count_fake = count_non_zero(_)
+                count_fake = count_non_zero(generated_tensor)
                 count_real = count_non_zero(real_layout_tensor)
                 zeros = torch.zeros_like(count_fake, requires_grad=True).to(device)
                 ones = torch.ones_like(count_fake, requires_grad=True).to(device)
                 disc_loss_count = count_criterion(count_fake, ones) + count_criterion(count_real, zeros)
                 disc_loss += disc_loss_count
 
-                _, disc_fake_pred = get_fake_pred(should_detach=True)
-                tmp = get_text_loss(_)
+                tmp = get_text_loss(generated_tensor)
                 text_fake = torch.tensor(tmp, requires_grad=True).to(device)
                 tmp = get_text_loss(real_layout_tensor)
                 text_real = torch.tensor(tmp, requires_grad=True).to(device)
@@ -385,19 +383,18 @@ class LayoutGAN:
                 if (idx + 1) % 1 == 0:
                     gen_opt.zero_grad()
 
-                    _, disc_fake_pred = get_fake_pred(should_detach=False)
-                    ones = torch.ones_like(disc_fake_pred, requires_grad=True)
+                    generated_tensor, disc_fake_pred = get_fake_pred(should_detach=False)
+
+                    ones = torch.ones_like(disc_fake_pred, requires_grad=True).to(device)
                     g_loss = main_criterion(disc_fake_pred, ones)
                     gen_loss = g_loss
 
-                    _, disc_fake_pred = get_fake_pred(should_detach=False)
-                    count = count_non_zero(_)
+                    count = count_non_zero(generated_tensor)
                     zeros = torch.zeros_like(count, requires_grad=True).to(device)
                     gen_loss_count = count_criterion(count, zeros)
                     gen_loss += gen_loss_count
 
-                    _, disc_fake_pred = get_fake_pred(should_detach=False)
-                    tmp = get_text_loss(_)
+                    tmp = get_text_loss(generated_tensor)
                     text_losses = torch.tensor(tmp, requires_grad=True).to(device)
                     zeros = torch.zeros_like(text_losses, requires_grad=True).to(device)
                     gen_loss_text = 3 * text_criterion(text_losses, zeros)
