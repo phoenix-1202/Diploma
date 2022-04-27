@@ -26,8 +26,8 @@ def count_non_zero(tensor):
     x = torch.count_nonzero(x, dim=1)
     x = x.type(torch.FloatTensor).to(device)
     z = torch.zeros_like(x)
-    x = torch.where(3 <= x, x, (x - 3) / 3)
-    x = torch.where(x <= 8, x, (8 - x) / 3)
+    x = torch.where(3 <= x, x, (x - 3) * 10)
+    x = torch.where(x <= 8, x, (8 - x) * 10)
     x = torch.where(x < 0, -x, z)
     return x
 
@@ -310,8 +310,8 @@ class LayoutGAN:
         disc_opt = torch.optim.Adam(self.disc.parameters(), lr=10e-5, amsgrad=True)
 
         main_criterion = torch.nn.BCELoss()
-        count_criterion = torch.nn.BCELoss()
-        text_criterion = torch.nn.BCELoss()
+        count_criterion = torch.nn.MSELoss()
+        text_criterion = torch.nn.L1Loss()
 
         row_data = np.load('./data/data.npy')
         dataloader = DataLoader(TensorDataset(torch.Tensor(row_data)), batch_size=BATCH, shuffle=True, drop_last=True)
