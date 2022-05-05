@@ -327,7 +327,7 @@ class LayoutGAN:
             checkpoint = torch.load(CHECKPOINT_PATH, map_location=device)
             start_epoch = checkpoint['start_epoch']
             BEST_MODEL_FAIL_OBJECTS = checkpoint['best_fail']
-            counter = start_epoch * 49  # batch count
+            counter = start_epoch * 40  # batch count
             self.gen.load_state_dict(checkpoint['generator'])
             self.disc.load_state_dict(checkpoint['discriminator'])
             gen_opt.load_state_dict(checkpoint['gen_opt'])
@@ -374,13 +374,24 @@ class LayoutGAN:
 
                 real_layout_tensor = data[0].to(device)
                 d_real = self.disc(real_layout_tensor)
-                generated_tensor, d_generated = get_fake_pred(should_detach=True)
-
-                gp = gradient_penalty(real_layout_tensor, generated_tensor)
-                disc_loss = d_generated.mean() - d_real.mean() + gp
+				
+                _, d_generated = get_fake_pred(should_detach=True)
+                ones = torch.ones_like(d_real)
+                zeros = torch.zeros_like(d_real)
+				
+                disc_loss = main_criterion(d_real, ones) + main_criterion(d_generated, zeros)
                 disc_loss.backward()
                 disc_opt.step()
-
+                
+                # ------------
+                
+                gen_opt.zero_grad()
+                
+                _, d_generated = get_fake_pred(should_detach=False)
+                gen_loss = main_criterion(d_generated, ones)
+                gen_loss.backward()
+                gen_opt.step()
+				
                 # modified_generated = modify_tensor(generated_tensor)
                 # zeros = torch.zeros_like(d_generated, requires_grad=True).to(device)
                 # ones = torch.ones_like(d_generated, requires_grad=True).to(device)
@@ -403,13 +414,13 @@ class LayoutGAN:
                 # disc_loss.backward()
                 # disc_opt.step()
 
-                if (idx + 1) % 5 == 0:
-                    gen_opt.zero_grad()
-                    _, disc_fake_pred = get_fake_pred(should_detach=False)
-                    gen_loss = -disc_fake_pred.mean().view(-1)
-                    gen_loss.backward()
-                    gen_opt.step()
-
+                # if (idx + 1) % 5 == 0:
+                    # gen_opt.zero_grad()
+                    # _, disc_fake_pred = get_fake_pred(should_detach=False)
+                    # gen_loss = -disc_fake_pred.mean().view(-1)
+                    # gen_loss.backward()
+                    # gen_opt.step()
+					# 
                     # gen_opt.zero_grad()
                     # _, disc_fake_pred = get_fake_pred(should_detach=False)
                     # count = count_non_zero(_)
@@ -443,7 +454,7 @@ class LayoutGAN:
                     # gen_loss.backward()
                     # gen_opt.step()
 
-                if counter % 49 == 0:
+                if counter % 40 == 0:
                     res_tensor, _ = get_fake_pred(should_detach=True)
                     # count = count_non_zero(modified_generated)
                     # cnt = torch.count_nonzero(count)
@@ -465,7 +476,7 @@ class LayoutGAN:
                                 'disc_opt': disc_opt.state_dict()
                                 }, CHECKPOINT_PATH)
 
-                    if counter % 10 == 0:
+                    if counter % 400 == 0:
                         image = layout_bbox(res_tensor, WIDTH, HEIGHT)
                         write_json(res_tensor, '{:02d}_{:04d}'.format(epoch, idx))
                         size = image_manifold_size(list(image.size())[0])
