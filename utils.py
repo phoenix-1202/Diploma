@@ -1,3 +1,4 @@
+import torch
 import numpy as np
 from PIL import Image
 import imageio as imageio
@@ -24,7 +25,7 @@ def save_npy_img(images, size, image_path):
                                  [128, 0, 128],
                                  [0, 128, 128],
                                  [128, 128, 128],
-                                 [64, 0, 0]], dtype='uint8').flatten()
+                                 [0, 0, 0]], dtype='uint8').flatten()
 
     cls_map_all = np.zeros((images.shape[0], images.shape[1], images.shape[2], 3), dtype=np.uint8)
 
@@ -133,7 +134,6 @@ def write_json(big_image, name=""):
 def get_area(rect1, rect2):
     x1, y1, w1, h1 = rect1[0], rect1[1], rect1[2], rect1[3]
     x2, y2, w2, h2 = rect2[0], rect2[1], rect2[2], rect2[3]
-    s = h1 * w1 + h2 * w2
     ld1 = (x1 - w1 / 2, y1 - h1 / 2)
     ru1 = (x1 + w1 / 2, y1 + h1 / 2)
     ld2 = (x2 - w2 / 2, y2 - h2 / 2)
@@ -147,31 +147,4 @@ def get_area(rect1, rect2):
     height = top - bottom
     if width < 0 or height < 0:
         return 0.
-    return 2 * width * height / s
-
-
-def get_text_loss(tensor):
-    ans = []
-    for t in tensor:
-        cnt = 0
-        texts = []
-        for obj in t:
-            maxi, pos = 0, -1
-            for i in range(4, 11):
-                if obj[i] > maxi:
-                    maxi = obj[i]
-                    pos = i
-            if pos == 10:
-                cnt += 1
-                texts.append(obj)
-        delta = 0.
-        pair = 0
-        for i in range(cnt - 1):
-            for j in range(i + 1, cnt):
-                delta += get_area(texts[i], texts[j])
-                pair += 1
-        if pair == 0:
-            ans.append(0.)
-        else:
-            ans.append(delta / pair)
-    return ans
+    return width * height / min(h1 * w1, h2 * w2)
