@@ -4,7 +4,9 @@ import torch
 from tqdm.auto import tqdm
 import numpy as np
 from torch.utils.data import DataLoader, TensorDataset
-from utils import save_npy_img, image_manifold_size, write_json, get_text_loss
+from utils import save_npy_img, image_manifold_size, write_json
+
+from testing import *
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 CHECKPOINT_PATH = "./checkpoint/last_state.pth"
@@ -13,53 +15,21 @@ BEST_CHECKPOINT_PATH = "./checkpoint/best_last_state.pth"
 WIDTH = 108
 HEIGHT = 108
 
-OBJ = 11
-LEN_CLASSES = 7
+OBJ = 9
+LEN_CLASSES = 5
 P = 4
 
-FROM = 0.5
 BATCH = 64
 
 
-# def count_non_zero(tensor):
-#     x = torch.count_nonzero(tensor, dim=2)
-#     x = torch.count_nonzero(x, dim=1)
-#     x = x.type(torch.FloatTensor).to(device)
-#     z = torch.zeros_like(x)
-#     o = torch.ones_like(x)
-#     x = torch.where(3 <= x, x, x - 3)
-#     x = torch.where(x <= 8, x, 8 - x)
-#     x = torch.where(x < 0, o, z)
-#     return x
+def layout_bbox(final_pred, output_width, output_height):
+    OO = final_pred.shape[1]
+    LL = OO - P
 
+    bbox_reg = final_pred[:, :, 0:P].to(device)
+    cls_prob = final_pred[:, :, P:P + LL].to(device)
 
-# def modify_tensor(batch_z):
-#     cl = batch_z[:, :, 4:11].to(device)
-#     z = torch.zeros_like(cl).to(device)
-#     o = torch.ones_like(cl).to(device)
-#
-#     new_cl = torch.where(cl > FROM, o, z).to(device)
-#     one = torch.ones(7).to(device)
-#     res = torch.matmul(new_cl, one).to(device)
-#
-#     res = torch.diag_embed(res).to(device)
-#     z = torch.zeros_like(res).to(device)
-#     o = torch.ones_like(res).to(device)
-#
-#     new_res = torch.where(res >= float(1.), o, z).to(device)
-#     return torch.matmul(new_res, batch_z)
-
-
-def layout_bbox(final_pred, output_height, output_width):
-    batch_size = final_pred.shape[0]
-    objects_cnt = final_pred.shape[1]
-    vector_size = final_pred.shape[2]
-    properties_cnt = vector_size - LEN_CLASSES
-
-    bbox_reg = final_pred[:, :, 0:properties_cnt].to(device)
-    cls_prob = final_pred[:, :, properties_cnt:vector_size].to(device)
-
-    bbox_reg = torch.reshape(bbox_reg, (batch_size, objects_cnt, properties_cnt))
+    bbox_reg = torch.reshape(bbox_reg, (BATCH, OO, P))
 
     x_c = bbox_reg[:, :, 0:1] * output_width
     y_c = bbox_reg[:, :, 1:2] * output_height
@@ -72,17 +42,17 @@ def layout_bbox(final_pred, output_height, output_width):
     y2 = y_c + 0.5 * h
 
     xt = torch.reshape(torch.arange(0.0, output_width, 1.0), (1, 1, 1, -1)).to(device)
-    xt = torch.reshape(torch.tile(xt, (batch_size, objects_cnt, output_height, 1)), (batch_size, objects_cnt, -1)).to(
+    xt = torch.reshape(torch.tile(xt, (BATCH, OO, output_height, 1)), (BATCH, OO, -1)).to(
         device)
 
     yt = torch.reshape(torch.arange(0.0, output_height, 1.0), (1, 1, -1, 1)).to(device)
-    yt = torch.reshape(torch.tile(yt, (batch_size, objects_cnt, 1, output_width)), (batch_size, objects_cnt, -1)).to(
+    yt = torch.reshape(torch.tile(yt, (BATCH, OO, 1, output_width)), (BATCH, OO, -1)).to(
         device)
 
-    x1_diff = torch.reshape(xt - x1, (batch_size, objects_cnt, output_height, output_width, 1))
-    y1_diff = torch.reshape(yt - y1, (batch_size, objects_cnt, output_height, output_width, 1))
-    x2_diff = torch.reshape(x2 - xt, (batch_size, objects_cnt, output_height, output_width, 1))
-    y2_diff = torch.reshape(y2 - yt, (batch_size, objects_cnt, output_height, output_width, 1))
+    x1_diff = torch.reshape(xt - x1, (BATCH, OO, output_height, output_width, 1))
+    y1_diff = torch.reshape(yt - y1, (BATCH, OO, output_height, output_width, 1))
+    x2_diff = torch.reshape(x2 - xt, (BATCH, OO, output_height, output_width, 1))
+    y2_diff = torch.reshape(y2 - yt, (BATCH, OO, output_height, output_width, 1))
 
     f = torch.nn.ReLU()
     x1_line = f(1.0 - torch.abs(x1_diff)) * \
@@ -101,175 +71,152 @@ def layout_bbox(final_pred, output_height, output_width):
     xy = torch.cat((x1_line, x2_line, y1_line, y2_line), dim=-1)
     xy_max = torch.amax(xy, dim=-1, keepdim=True)
 
-    spatial_prob = torch.multiply(torch.tile(xy_max, (1, 1, 1, 1, LEN_CLASSES)),
-                                  torch.reshape(cls_prob, (batch_size, objects_cnt, 1, 1, LEN_CLASSES)))
+    spatial_prob = torch.multiply(torch.tile(xy_max, (1, 1, 1, 1, LL)),
+                                  torch.reshape(cls_prob, (BATCH, OO, 1, 1, LL)))
     spatial_prob_max = torch.amax(spatial_prob, dim=1, keepdim=False)
 
     return spatial_prob_max
 
 
-def get_relation_non_local_block1(C):
-    f_v = torch.nn.Conv2d(in_channels=C, out_channels=C, kernel_size=(1, 1), stride=(1, 1))
-    f_k = torch.nn.Conv2d(in_channels=C, out_channels=C, kernel_size=(1, 1), stride=(1, 1))
-    f_q = torch.nn.Conv2d(in_channels=C, out_channels=C, kernel_size=(1, 1), stride=(1, 1))
-    return f_v, f_k, f_q
+class RelationNonLocal(torch.nn.Module):
+    def __init__(self, channels) -> None:
+        super().__init__()
+        self.channels = channels
 
+        self.cv0 = torch.nn.Conv2d(channels, channels, kernel_size=(1, 1))
+        self.cv1 = torch.nn.Conv2d(channels, channels, kernel_size=(1, 1))
+        self.cv2 = torch.nn.Conv2d(channels, channels, kernel_size=(1, 1))
+        self.cv3 = torch.nn.Conv2d(channels, channels, kernel_size=(1, 1))
 
-class Generator(torch.nn.Module):
+    def forward(self, inputs):
+        N, C, H, W = inputs.shape
+        assert C == self.channels, (C, self.channels)
 
-    def __init__(self):
-        super(Generator, self).__init__()
-        self.h0_0 = torch.nn.Sequential(
-            torch.nn.Conv2d(in_channels=P + LEN_CLASSES, out_channels=256, kernel_size=(1, 1), stride=(1, 1)),
-            torch.nn.BatchNorm2d(256),
-        )
-        self.h0_1 = torch.nn.Sequential(
-            torch.nn.Conv2d(in_channels=P + LEN_CLASSES, out_channels=64, kernel_size=(1, 1), stride=(1, 1)),
-            torch.nn.BatchNorm2d(64),
-            torch.nn.ReLU()
-        )
-        self.h0_3 = torch.nn.Sequential(
-            torch.nn.Conv2d(in_channels=64, out_channels=64, kernel_size=(1, 1), stride=(1, 1)),
-            torch.nn.BatchNorm2d(64),
-            torch.nn.ReLU(),
-            torch.nn.Conv2d(in_channels=64, out_channels=256, kernel_size=(1, 1), stride=(1, 1)),
-            torch.nn.BatchNorm2d(256),
-        )
-
-        self.h1_0 = torch.nn.Sequential(
-            torch.nn.Conv2d(in_channels=256, out_channels=1024, kernel_size=(1, 1), stride=(1, 1)),
-            torch.nn.BatchNorm2d(1024),
-        )
-        self.h1_1 = torch.nn.Sequential(
-            torch.nn.Conv2d(in_channels=1024, out_channels=256, kernel_size=(1, 1), stride=(1, 1)),
-            torch.nn.BatchNorm2d(256),
-            torch.nn.ReLU()
-        )
-        self.h1_3 = torch.nn.Sequential(
-            torch.nn.Conv2d(in_channels=256, out_channels=256, kernel_size=(1, 1), stride=(1, 1)),
-            torch.nn.BatchNorm2d(256),
-            torch.nn.ReLU(),
-            torch.nn.Conv2d(in_channels=256, out_channels=1024, kernel_size=(1, 1), stride=(1, 1)),
-            torch.nn.BatchNorm2d(1024),
-        )
-
-        self.relu = torch.nn.ReLU()
-
-        self.bn_x0 = torch.nn.BatchNorm2d(256)
-        self.bn_x1 = torch.nn.BatchNorm2d(256)
-        self.bn_x2 = torch.nn.BatchNorm2d(1024)
-        self.bn_x3 = torch.nn.BatchNorm2d(1024)
-        self.bn_x0_relu = torch.nn.Sequential(
-            torch.nn.BatchNorm2d(256),
-            torch.nn.ReLU()
-        )
-        self.bn_x1_relu = torch.nn.Sequential(
-            torch.nn.BatchNorm2d(256),
-            torch.nn.ReLU()
-        )
-        self.bn_x2_relu = torch.nn.Sequential(
-            torch.nn.BatchNorm2d(1024),
-            torch.nn.ReLU()
-        )
-        self.bn_x3_relu = torch.nn.Sequential(
-            torch.nn.BatchNorm2d(1024),
-            torch.nn.ReLU()
-        )
-
-        self.v0, self.k0, self.q0 = get_relation_non_local_block1(256)
-        self.v1, self.k1, self.q1 = get_relation_non_local_block1(256)
-        self.v2, self.k2, self.q2 = get_relation_non_local_block1(1024)
-        self.v3, self.k3, self.q3 = get_relation_non_local_block1(1024)
-
-        self.r0 = torch.nn.Conv2d(in_channels=256, out_channels=256, kernel_size=(1, 1), stride=(1, 1))
-        self.r1 = torch.nn.Conv2d(in_channels=256, out_channels=256, kernel_size=(1, 1), stride=(1, 1))
-        self.r2 = torch.nn.Conv2d(in_channels=1024, out_channels=1024, kernel_size=(1, 1), stride=(1, 1))
-        self.r3 = torch.nn.Conv2d(in_channels=1024, out_channels=1024, kernel_size=(1, 1), stride=(1, 1))
-
-        self.bbox0 = torch.nn.Conv2d(in_channels=1024, out_channels=P, kernel_size=(1, 1), stride=(1, 1))
-        self.bbox1 = torch.nn.Sigmoid()
-
-        self.cls0 = torch.nn.Conv2d(in_channels=1024, out_channels=LEN_CLASSES, kernel_size=(1, 1), stride=(1, 1))
-        self.cls1 = torch.nn.Sigmoid()
-
-    def relation_non_local(self, input_, i):
-        shape_org = list(input_.size())
-        N, C, H, W = shape_org[0], shape_org[1], shape_org[2], shape_org[3]
         output_dim, d_k, d_g = C, C, C
 
-        if i == 0:
-            f_v, f_k, f_q = self.v0.to(device)(input_), self.k0.to(device)(input_), self.q0.to(device)(input_)
-        elif i == 1:
-            f_v, f_k, f_q = self.v1.to(device)(input_), self.k1.to(device)(input_), self.q1.to(device)(input_)
-        elif i == 2:
-            f_v, f_k, f_q = self.v2.to(device)(input_), self.k2.to(device)(input_), self.q2.to(device)(input_)
-        else:
-            f_v, f_k, f_q = self.v3.to(device)(input_), self.k3.to(device)(input_), self.q3.to(device)(input_)
+        # NCHW -> NHWC
+        f_v = self.cv0(inputs).permute(0, 2, 3, 1).contiguous()
+        f_k = self.cv1(inputs).permute(0, 2, 3, 1).contiguous()
+        f_q = self.cv2(inputs).permute(0, 2, 3, 1).contiguous()
 
-        f_k = torch.permute(torch.reshape(f_k, (N, d_k, H * W)), (0, 2, 1)).to(device)
-        f_q = torch.reshape(f_q, (N, d_k, H * W)).to(device)
+        f_k = torch.reshape(f_k, (N, H * W, d_k))
+        f_q = torch.reshape(f_q, (N, H * W, d_k))
+        f_q = f_q.permute(0, 2, 1).contiguous()
+        f_v = torch.reshape(f_v, (N, H * W, output_dim))
+
+        # (N, H*W, d_k) * (N, d_k, H*W) -> (N, H*W, H*W)
         w = torch.matmul(f_k, f_q) / (H * W)
 
-        f_v = torch.permute(torch.reshape(f_v, (N, d_k, H * W)), (0, 2, 1)).to(device)
-        f_r = torch.matmul(torch.permute(w, (0, 2, 1)), f_v).to(device)
-        f_r = torch.reshape(torch.permute(f_r, (0, 2, 1)), (N, output_dim, H, W)).to(device)
+        # (N, H*W, H*W) * (N, H*W, output_dim) -> (N, H*W, output_dim)
+        f_r = torch.matmul(w.permute(0, 2, 1).contiguous(), f_v)
+        f_r = torch.reshape(f_r, (N, H, W, output_dim))
 
-        if i == 0:
-            f_r = self.r0.to(device)(f_r)
-        elif i == 1:
-            f_r = self.r1.to(device)(f_r)
-        elif i == 2:
-            f_r = self.r2.to(device)(f_r)
-        else:
-            f_r = self.r3.to(device)(f_r)
+        # NHWC -> NCHW
+        f_r = f_r.permute(0, 3, 1, 2).contiguous()
+        f_r = self.cv3(f_r)
 
         return f_r
 
-    def forward(self, noise):
-        # bbox_noise = self.linear4(self.linear3(self.linear2(self.linear1(noise))))
-        # bbox_noise = self.relu(bbox_noise)
-        # bbox_noise = torch.reshape(bbox_noise, (64, 11, 11))
-        # bbox_noise = modify_tensor(bbox_noise)
-        gnet = torch.reshape(noise, (BATCH, OBJ, 1, P + LEN_CLASSES))
-        gnet = torch.permute(gnet, (0, 3, 1, 2))
 
-        h0_0 = self.h0_0(gnet)
-        h0_1 = self.h0_1(gnet)
-        h0_3 = self.h0_3(h0_1)
-        add = torch.add(h0_0, h0_3)
-        gnet = self.relu(add)
+def initialize_layer(m):
+    if isinstance(m, torch.nn.Conv2d):
+        torch.nn.init.normal_(m.weight, 0.0, 0.02)
+        torch.nn.init.zeros_(m.bias)
+    if isinstance(m, torch.nn.Linear):
+        torch.nn.init.normal_(m.weight, 0.0, 0.02)
+        torch.nn.init.zeros_(m.bias)
 
-        rl0 = self.bn_x0(self.relation_non_local(gnet, 0))
-        add0 = torch.add(gnet, rl0)
-        gnet = self.bn_x0_relu(add0)
 
-        rl1 = self.bn_x1(self.relation_non_local(gnet, 1))
-        add1 = torch.add(gnet, rl1)
-        gnet = self.bn_x1_relu(add1)
+class Generator(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
 
-        h1_0 = self.h1_0(gnet)
-        h1_1 = self.h1_1(h1_0)
-        h1_3 = self.h1_3(h1_1)
-        add = torch.add(h1_0, h1_3)
-        gnet = self.relu(add)
+        self.bn0_0 = torch.nn.BatchNorm2d(256)
+        self.bn0_1 = torch.nn.BatchNorm2d(64)
+        self.bn0_2 = torch.nn.BatchNorm2d(64)
+        self.bn0_3 = torch.nn.BatchNorm2d(256)
 
-        rl0 = self.bn_x2(self.relation_non_local(gnet, 2))
-        add0 = torch.add(gnet, rl0)
-        gnet = self.bn_x2_relu(add0)
+        self.cv0_0 = torch.nn.Conv2d(P + LEN_CLASSES, 256, kernel_size=(1, 1))
+        self.cv0_1 = torch.nn.Conv2d(P + LEN_CLASSES, 64, kernel_size=(1, 1))
+        self.cv0_2 = torch.nn.Conv2d(64, 64, kernel_size=(1, 1))
+        self.cv0_3 = torch.nn.Conv2d(64, 256, kernel_size=(1, 1))
 
-        rl1 = self.bn_x3(self.relation_non_local(gnet, 3))
-        add1 = torch.add(gnet, rl1)
-        gnet = self.bn_x3_relu(add1)
+        self.bn1_0 = torch.nn.BatchNorm2d(1024)
+        self.bn1_1 = torch.nn.BatchNorm2d(256)
+        self.bn1_2 = torch.nn.BatchNorm2d(256)
+        self.bn1_3 = torch.nn.BatchNorm2d(1024)
 
-        bbox_pred = self.bbox0.to(device)(gnet)
-        bbox_pred = torch.permute(bbox_pred, (0, 2, 3, 1))
-        bbox_pred = self.bbox1.to(device)(torch.reshape(bbox_pred, (BATCH, OBJ, P)))
+        self.cv1_0 = torch.nn.Conv2d(256, 1024, kernel_size=(1, 1))
+        self.cv1_1 = torch.nn.Conv2d(1024, 256, kernel_size=(1, 1))
+        self.cv1_2 = torch.nn.Conv2d(256, 256, kernel_size=(1, 1))
+        self.cv1_3 = torch.nn.Conv2d(256, 1024, kernel_size=(1, 1))
 
-        cls_score = self.cls0.to(device)(gnet)
-        cls_score = torch.permute(cls_score, (0, 2, 3, 1))
-        cls_prob = self.cls1.to(device)(torch.reshape(cls_score, (BATCH, OBJ, LEN_CLASSES)))
+        self.g_bn_x0 = torch.nn.BatchNorm2d(256)
+        self.g_bn_x1 = torch.nn.BatchNorm2d(256)
+        self.g_bn_x2 = torch.nn.BatchNorm2d(256)
+        self.g_bn_x3 = torch.nn.BatchNorm2d(256)
 
-        final_pred = torch.cat((bbox_pred, cls_prob), dim=-1)
+        self.rel0 = RelationNonLocal(256)
+        self.rel1 = RelationNonLocal(256)
+
+        self.g_bn_x4 = torch.nn.BatchNorm2d(1024)
+        self.g_bn_x5 = torch.nn.BatchNorm2d(1024)
+        self.g_bn_x6 = torch.nn.BatchNorm2d(1024)
+        self.g_bn_x7 = torch.nn.BatchNorm2d(1024)
+
+        self.rel2 = RelationNonLocal(1024)
+        self.rel3 = RelationNonLocal(1024)
+
+        self.cv_bbox = torch.nn.Conv2d(1024, P, kernel_size=(1, 1))
+        self.cv_cls = torch.nn.Conv2d(1024, LEN_CLASSES, kernel_size=(1, 1))
+
+        self.relu = torch.nn.ReLU()
+
+        self.rel0.apply(initialize_layer)
+        self.rel1.apply(initialize_layer)
+        self.rel2.apply(initialize_layer)
+        self.rel3.apply(initialize_layer)
+
+    def forward(self, z):
+        gnet = torch.permute(z, (0, 2, 1))
+        gnet = torch.reshape(gnet, (BATCH, P + LEN_CLASSES, OBJ, 1))
+
+        # gnet -> h0_0
+        #  └─> h0_1 -> h0_2 -> h0_3
+        h0_0 = self.bn0_0(self.cv0_0(gnet))
+        h0_1 = self.relu(self.bn0_1(self.cv0_1(gnet)))
+        h0_2 = self.relu(self.bn0_2(self.cv0_2(h0_1)))
+        h0_3 = self.bn0_3(self.cv0_3(h0_2))
+
+        # gnet: (-1, 256, NUM, 1)
+        gnet = self.relu(torch.add(h0_0, h0_3))
+
+        gnet = self.relu(self.g_bn_x1(torch.add(gnet, self.g_bn_x0(self.rel0(gnet)))))
+        gnet = self.relu(self.g_bn_x3(torch.add(gnet, self.g_bn_x2(self.rel1(gnet)))))
+
+        # gnet -> h1_0 -> h1_1 -> h1_2 -> h1_3
+        h1_0 = self.bn1_0(self.cv1_0(gnet))
+        h1_1 = self.relu(self.bn1_1(self.cv1_1(h1_0)))
+        h1_2 = self.relu(self.bn1_2(self.cv1_2(h1_1)))
+        h1_3 = self.bn1_3(self.cv1_3(h1_2))
+        # gnet: (-1, 256, NUM, 1)
+        gnet = self.relu(torch.add(h1_0, h1_3))
+
+        gnet = self.relu(self.g_bn_x5(torch.add(gnet, self.g_bn_x4(self.rel2(gnet)))))
+        gnet = self.relu(self.g_bn_x7(torch.add(gnet, self.g_bn_x6(self.rel3(gnet)))))
+
+        bbox_pred = self.cv_bbox(gnet)
+        bbox_pred = torch.reshape(bbox_pred, (-1, P, OBJ))
+        bbox_pred = torch.sigmoid(bbox_pred)  # : 0 ~ 1
+
+        cls_score = self.cv_cls(gnet)
+        cls_score = torch.reshape(cls_score, (-1, LEN_CLASSES, OBJ))
+        cls_prob = torch.sigmoid(cls_score)  # : 0 ~ 1
+
+        # (-1, DIM+CLS, NUM)
+        final_pred = torch.cat([bbox_pred, cls_prob], dim=1)
+        final_pred = torch.permute(final_pred, (0, 2, 1))
+
         return final_pred
 
 
@@ -287,7 +234,7 @@ class Discriminator(torch.nn.Module):
             torch.nn.BatchNorm2d(64),
             torch.nn.LeakyReLU(0.2),
             torch.nn.Flatten(),
-            torch.nn.Linear(in_features=36864, out_features=512),  # 5376
+            torch.nn.Linear(in_features=5376, out_features=512),
             torch.nn.BatchNorm1d(512),
             torch.nn.LeakyReLU(0.2),
             torch.nn.Linear(in_features=512, out_features=1),
@@ -301,44 +248,39 @@ class Discriminator(torch.nn.Module):
         return output
 
 
+def gen_noise():
+    batch_z_bbox = np.random.normal(0.5, 0.15, (BATCH, OBJ, P))
+    batch_z_cls = np.identity(LEN_CLASSES)[np.random.randint(LEN_CLASSES, size=(BATCH, OBJ))]
+    batch_z = np.concatenate([batch_z_bbox, batch_z_cls], axis=-1)
+    noise = torch.tensor(batch_z, dtype=torch.float).to(device)
+    return noise
+
+
 class LayoutGAN:
     def __init__(self):
         self.gen = Generator().to(device)
         self.disc = Discriminator().to(device)
 
     def train(self):
-        n_epoch = 10001
+        n_epoch = 101
         start_epoch = 0
-        counter = 0
 
-        gen_opt = torch.optim.Adam(self.gen.parameters(), lr=10e-5, amsgrad=True)
-        disc_opt = torch.optim.Adam(self.disc.parameters(), lr=10e-5, amsgrad=True)
+        gen_opt = torch.optim.Adam(self.gen.parameters(), lr=5e-5)
+        disc_opt = torch.optim.Adam(self.disc.parameters(), lr=5e-5)
 
-        main_criterion = torch.nn.BCELoss()
-        count_criterion = torch.nn.L1Loss()
-        text_criterion = torch.nn.MSELoss()
+        criterion = torch.nn.BCELoss()
 
-        row_data = np.load('./data/data.npy')
+        row_data = np.load('./data/doc_train.npy')
         dataloader = DataLoader(TensorDataset(torch.Tensor(row_data)), batch_size=BATCH, shuffle=True, drop_last=True)
-        BEST_MODEL_FAIL_OBJECTS = 64
 
         checkpoint_file = Path(CHECKPOINT_PATH)
         if checkpoint_file.exists():
-            checkpoint = torch.load(CHECKPOINT_PATH, map_location=device)
+            checkpoint = torch.load(CHECKPOINT_PATH)
             start_epoch = checkpoint['start_epoch']
-            BEST_MODEL_FAIL_OBJECTS = checkpoint['best_fail']
-            counter = start_epoch * 40  # batch count
             self.gen.load_state_dict(checkpoint['generator'])
             self.disc.load_state_dict(checkpoint['discriminator'])
             gen_opt.load_state_dict(checkpoint['gen_opt'])
             disc_opt.load_state_dict(checkpoint['disc_opt'])
-
-        def gen_noise():
-            batch_z_bbox = np.random.normal(0.5, 0.15, (BATCH, OBJ, P))
-            batch_z_cls = np.identity(LEN_CLASSES)[np.random.randint(LEN_CLASSES, size=(BATCH, OBJ))]
-            batch_z = np.concatenate([batch_z_bbox, batch_z_cls], axis=-1)
-            noise = torch.tensor(batch_z, dtype=torch.float).to(device)
-            return noise
 
         def get_fake_pred(should_detach):
             noise = gen_noise()
@@ -350,138 +292,86 @@ class LayoutGAN:
             fake_pred = self.disc(fake_tensor)
             return fake_tensor, fake_pred
 
-        def gradient_penalty(real_data, generated_data):
-            alpha = torch.rand(64, 1, 1).to(device)
-            alpha = alpha.expand_as(real_data)
-            interpolated = alpha * real_data + (1 - alpha) * generated_data
-            interpolated = torch.autograd.Variable(interpolated, requires_grad=True).to(device)
-            prob_interpolated = self.disc(interpolated)
-
-            gradients = torch.autograd.grad(outputs=prob_interpolated, inputs=interpolated,
-                                            grad_outputs=torch.ones(prob_interpolated.size()).to(device),
-                                            create_graph=True, retain_graph=True)[0]
-
-            gradients = gradients.view(64, -1)
-            gradients_norm = gradients.norm(2, 1)
-
-            return torch.mean((gradients_norm - 1) ** 2)
-
+        my_sample = gen_noise()
+        counter = 0
         for epoch in range(start_epoch, n_epoch):
             print("Epoch ", epoch)
             idx = 0
             for data in tqdm(dataloader):
-                disc_opt.zero_grad()
-
                 real_layout_tensor = data[0].to(device)
-                d_real = self.disc(real_layout_tensor)
-				
-                _, d_generated = get_fake_pred(should_detach=True)
-                ones = torch.ones_like(d_real)
-                zeros = torch.zeros_like(d_real)
-				
-                disc_loss = main_criterion(d_real, ones) + main_criterion(d_generated, zeros)
+
+                # Update D network
+                # Train with all-real batch
+                disc_opt.zero_grad()
+                disc_real_pred = self.disc(real_layout_tensor)
+                label = torch.ones_like(disc_real_pred)
+                disc_loss_real = criterion(disc_real_pred, label)
+
+                # Train with all-fake batch
+                _, disc_fake_pred = get_fake_pred(should_detach=True)
+                label = torch.zeros_like(disc_fake_pred)
+                disc_loss_fake = criterion(disc_fake_pred, label)
+
+                disc_loss = disc_loss_real + disc_loss_fake
                 disc_loss.backward()
                 disc_opt.step()
-                
-                # ------------
-                
+
+                # Update G network
                 gen_opt.zero_grad()
-                
-                _, d_generated = get_fake_pred(should_detach=False)
-                gen_loss = main_criterion(d_generated, ones)
+                _, disc_fake_pred = get_fake_pred(should_detach=False)
+                label = torch.ones_like(disc_fake_pred)
+                gen_loss = criterion(disc_fake_pred, label)
                 gen_loss.backward()
                 gen_opt.step()
-				
-                # modified_generated = modify_tensor(generated_tensor)
-                # zeros = torch.zeros_like(d_generated, requires_grad=True).to(device)
-                # ones = torch.ones_like(d_generated, requires_grad=True).to(device)
-                # d_loss = main_criterion(d_generated, zeros) + main_criterion(d_real, ones)
-                # disc_loss = d_loss
-                #
-                # count_fake = count_non_zero(modified_generated)
-                # ones = torch.ones_like(count_fake, requires_grad=True).to(device)
-                # # count_criterion(count_real, zeros) = 0
-                # disc_loss_count = count_criterion(count_fake, ones)
-                # disc_loss += disc_loss_count
-                #
-                # tmp = get_text_loss(modified_generated)
-                # text_fake = torch.tensor(tmp, requires_grad=True).to(device)
-                # ones = torch.ones_like(text_fake, requires_grad=True).to(device)
-                # # text_criterion(text_real, zeros) = 0
-                # disc_loss_text = 100 * text_criterion(text_fake, ones)
-                # disc_loss += disc_loss_text
-                #
-                # disc_loss.backward()
-                # disc_opt.step()
 
-                # if (idx + 1) % 5 == 0:
-                    # gen_opt.zero_grad()
-                    # _, disc_fake_pred = get_fake_pred(should_detach=False)
-                    # gen_loss = -disc_fake_pred.mean().view(-1)
-                    # gen_loss.backward()
-                    # gen_opt.step()
-					# 
-                    # gen_opt.zero_grad()
-                    # _, disc_fake_pred = get_fake_pred(should_detach=False)
-                    # count = count_non_zero(_)
-                    # label = torch.zeros_like(count, requires_grad=True).to(device)
-                    # gen_loss_count = count_criterion(count, label)
-                    # gen_loss += gen_loss_count.item()
-                    # gen_loss_count.backward()
-                    # gen_opt.step()
-                    #
-                    # gen_opt.zero_grad()
-                    #
-                    # generated_tensor, disc_fake_pred = get_fake_pred(should_detach=False)
-                    # cls = generated_tensor[:, :, 4:11].to(device)
-                    # modified_generated = modify_tensor(cls, generated_tensor)
-                    #
-                    # ones = torch.ones_like(disc_fake_pred, requires_grad=True).to(device)
-                    # g_loss = main_criterion(disc_fake_pred, ones)
-                    # gen_loss = g_loss
-                    #
-                    # count = count_non_zero(modified_generated)
-                    # zeros = torch.zeros_like(count, requires_grad=True).to(device)
-                    # gen_loss_count = count_criterion(count, zeros)
-                    # gen_loss += gen_loss_count
-                    #
-                    # tmp = get_text_loss(modified_generated)
-                    # text_losses = torch.tensor(tmp, requires_grad=True).to(device)
-                    # zeros = torch.zeros_like(text_losses, requires_grad=True).to(device)
-                    # gen_loss_text = 100 * text_criterion(text_losses, zeros)
-                    # gen_loss += gen_loss_text
-                    #
-                    # gen_loss.backward()
-                    # gen_opt.step()
-
-                if counter % 40 == 0:
-                    res_tensor, _ = get_fake_pred(should_detach=True)
-                    # count = count_non_zero(modified_generated)
-                    # cnt = torch.count_nonzero(count)
-                    # if cnt.item() <= 32 or cnt.item() < BEST_MODEL_FAIL_OBJECTS:
-                    #     BEST_MODEL_FAIL_OBJECTS = min(BEST_MODEL_FAIL_OBJECTS, cnt.item())
-                    #     torch.save({'start_epoch': epoch + 1,
-                    #                 'best_fail': BEST_MODEL_FAIL_OBJECTS,
-                    #                 'generator': self.gen.state_dict(),
-                    #                 'discriminator': self.disc.state_dict(),
-                    #                 'gen_opt': gen_opt.state_dict(),
-                    #                 'disc_opt': disc_opt.state_dict()
-                    #                 }, BEST_CHECKPOINT_PATH)
-
-                    torch.save({'start_epoch': epoch + 1,
-                                'best_fail': BEST_MODEL_FAIL_OBJECTS,
-                                'generator': self.gen.state_dict(),
-                                'discriminator': self.disc.state_dict(),
-                                'gen_opt': gen_opt.state_dict(),
-                                'disc_opt': disc_opt.state_dict()
-                                }, CHECKPOINT_PATH)
-
-                    if counter % 400 == 0:
-                        image = layout_bbox(res_tensor, WIDTH, HEIGHT)
-                        write_json(res_tensor, '{:02d}_{:04d}'.format(epoch, idx))
-                        size = image_manifold_size(list(image.size())[0])
-                        path = './samples/train_{:02d}_{:04d}.jpg'.format(epoch, idx)
-                        save_npy_img(image.detach().cpu().numpy(), size, path)
+                if counter % 500 == 0:
+                    with torch.no_grad():
+                        res_tensor = self.gen(my_sample)
+                    image = layout_bbox(res_tensor, WIDTH, HEIGHT)
+                    write_json(res_tensor, '{:03d}_{:04d}'.format(epoch, idx))
+                    size = image_manifold_size(list(image.size())[0])
+                    path = './samples/train_{:03d}_{:04d}.jpg'.format(epoch, idx)
+                    save_npy_img(image.detach().cpu().numpy(), size, path)
 
                 idx += 1
                 counter += 1
+
+            if epoch % 1 == 0:
+                torch.save({'start_epoch': epoch + 1,
+                            'generator': self.gen.state_dict(),
+                            'discriminator': self.disc.state_dict(),
+                            'gen_opt': gen_opt.state_dict(),
+                            'disc_opt': disc_opt.state_dict()
+                            }, CHECKPOINT_PATH)
+                torch.save({'start_epoch': epoch + 1,
+                            'generator': self.gen.state_dict(),
+                            'discriminator': self.disc.state_dict(),
+                            'gen_opt': gen_opt.state_dict(),
+                            'disc_opt': disc_opt.state_dict()
+                            }, "./checkpoint/state_{:03d}".format(epoch) + ".pth")
+
+    def test(self, cur_checkpoint):
+        checkpoint_file = Path(cur_checkpoint)
+        if checkpoint_file.exists():
+            checkpoint = torch.load(cur_checkpoint, map_location=device)
+            start_epoch = checkpoint['start_epoch']
+            print(start_epoch)
+            self.gen.load_state_dict(checkpoint['generator'])
+            self.disc.load_state_dict(checkpoint['discriminator'])
+
+            for idx in range(5):
+                tensor = gen_noise()
+                with torch.no_grad():
+                    res_tensor = self.gen(tensor)
+                image = layout_bbox(res_tensor, WIDTH, HEIGHT)
+                # write_json(res_tensor, '{:03d}_{:04d}'.format(start_epoch, idx))
+                size = image_manifold_size(list(image.size())[0])
+                path = './samples/test_{:03d}_{:04d}.jpg'.format(start_epoch, idx)
+                save_npy_img(image.detach().cpu().numpy(), size, path)
+
+                new_layout = from_doc_to_ad(res_tensor)
+                image = layout_bbox(new_layout, WIDTH, HEIGHT)
+                write_json(new_layout, '{:02d}'.format(idx))
+                size = image_manifold_size(list(image.size())[0])
+                path = './samples/ans_{:02d}.jpg'.format(idx)
+                save_npy_img(image.detach().cpu().numpy(), size, path)
